@@ -45,45 +45,75 @@ def validate_search_params(params: Dict[str, Any]) -> Dict[str, Any]:
         'sort_dir': params.get('sort_dir', 'desc')
     }
 
+
 def apply_search_filters(query, params: Dict[str, Any]):
-    """Apply search filters to query"""
+    """Apply search filters to query with corrected JSONB operations"""
     
+    # Text search
     if params['query']:
-        search_term = f"%{params['query']}%"
-        query = query.filter(
-            or_(
-                DetectionRule.name.ilike(search_term),
-                DetectionRule.description.ilike(search_term),
-                DetectionRule.rule_id.ilike(search_term)
+        search_term = f'%{params['query']}%'
+        search_conditions = [
+            DetectionRule.name.ilike(search_term),
+            DetectionRule.description.ilike(search_term),
+            DetectionRule.rule_id.ilike(search_term),
+            DetectionRule.rule_content.ilike(search_term),
+            RuleSource.name.ilike(search_term)
+        ]
+        
+        # Add JSONB search for MITRE techniques if query looks like technique ID
+        if params['query'].upper().startswith('T'):
+            search_conditions.append(
+                text("rule_metadata->'extracted_mitre_techniques' ? :tech_id").params(
+                    tech_id=params['query'].upper()
+                )
             )
-        )
+        
+        # Add JSONB search for CVE IDs if query looks like CVE
+        if params['query'].upper().startswith('CVE'):
+            search_conditions.append(
+                text("rule_metadata->'extracted_cve_ids' ? :cve_id").params(
+                    cve_id=params['query'].upper()
+                )
+            )
+        
+        query = query.join(RuleSource).filter(or_(*search_conditions))
     
+    # Rule type filtering
     if params['rule_types']:
         query = query.filter(DetectionRule.rule_type.in_(params['rule_types']))
     
+    # Severity filtering
     if params['severities']:
         query = query.filter(DetectionRule.severity.in_(params['severities']))
     
+    # Rule source filtering
     if params['rule_sources']:
         source_ids = [int(s) for s in params['rule_sources'] if s.isdigit()]
         if source_ids:
             query = query.filter(DetectionRule.source_id.in_(source_ids))
     
+    # Tags filtering
     if params['tags']:
         for tag in params['tags']:
             query = query.filter(DetectionRule.tags.contains([tag]))
     
+    # Active status filtering
     if params['is_active'] is not None:
         query = query.filter(DetectionRule.is_active == params['is_active'])
     
     # Platform filtering from metadata
     if params['rule_platforms']:
-        query = query.filter(
-            DetectionRule.rule_metadata['rule_platforms'].op('?|')(params['rule_platforms'])
-        )
+        platform_conditions = []
+        for platform in params['rule_platforms']:
+            platform_conditions.append(
+                text("rule_metadata->'rule_platforms' ? :platform").params(platform=platform)
+            )
+        if platform_conditions:
+            query = query.filter(or_(*platform_conditions))
     
-    # MITRE technique filtering
+    # MITRE technique filtering - FIXED
     if params['mitre_techniques']:
+        # Subquery for rules mapped via rule_mitre_mappings table
         technique_subquery = (
             query.session.query(RuleMitreMapping.rule_id)
             .join(MitreTechnique)
@@ -91,17 +121,26 @@ def apply_search_filters(query, params: Dict[str, Any]):
             .subquery()
         )
         
-        metadata_condition = DetectionRule.rule_metadata['extracted_mitre_techniques'].op('?|')(params['mitre_techniques'])
-        
-        query = query.filter(
-            or_(
-                DetectionRule.id.in_(technique_subquery),
-                metadata_condition
+        # Check metadata for each technique using ? operator
+        metadata_conditions = []
+        for tech_id in params['mitre_techniques']:
+            metadata_conditions.append(
+                text("rule_metadata->'extracted_mitre_techniques' ? :tech_id").params(tech_id=tech_id)
             )
-        )
+        
+        if metadata_conditions:
+            query = query.filter(
+                or_(
+                    DetectionRule.id.in_(technique_subquery),
+                    or_(*metadata_conditions)
+                )
+            )
+        else:
+            query = query.filter(DetectionRule.id.in_(technique_subquery))
     
-    # CVE filtering
+    # CVE filtering - FIXED
     if params['cve_ids']:
+        # Subquery for rules mapped via rule_cve_mappings table
         cve_subquery = (
             query.session.query(RuleCveMapping.rule_id)
             .join(CveEntry)
@@ -109,37 +148,52 @@ def apply_search_filters(query, params: Dict[str, Any]):
             .subquery()
         )
         
-        metadata_condition = DetectionRule.rule_metadata['extracted_cve_ids'].op('?|')(params['cve_ids'])
-        
-        query = query.filter(
-            or_(
-                DetectionRule.id.in_(cve_subquery),
-                metadata_condition
+        # Check metadata for each CVE using ? operator
+        metadata_conditions = []
+        for cve_id in params['cve_ids']:
+            metadata_conditions.append(
+                text("rule_metadata->'extracted_cve_ids' ? :cve_id").params(cve_id=cve_id)
             )
-        )
+        
+        if metadata_conditions:
+            query = query.filter(
+                or_(
+                    DetectionRule.id.in_(cve_subquery),
+                    or_(*metadata_conditions)
+                )
+            )
+        else:
+            query = query.filter(DetectionRule.id.in_(cve_subquery))
     
-    # New metadata filters
+    # SIEM platform filtering
     if params['siem_platforms']:
         query = query.filter(
             DetectionRule.rule_metadata['siem_platform'].astext.in_(params['siem_platforms'])
         )
     
+    # AOR filtering
     if params['aors']:
         query = query.filter(
             DetectionRule.rule_metadata['aor'].astext.in_(params['aors'])
         )
     
+    # Data sources filtering
     if params['data_sources']:
-        query = query.filter(
-            DetectionRule.rule_metadata['data_sources'].op('?|')(params['data_sources'])
-        )
+        ds_conditions = []
+        for ds in params['data_sources']:
+            ds_conditions.append(
+                text("rule_metadata->'data_sources' ? :ds").params(ds=ds)
+            )
+        if ds_conditions:
+            query = query.filter(or_(*ds_conditions))
     
+    # Info controls filtering
     if params['info_controls']:
         query = query.filter(
             DetectionRule.rule_metadata['info_controls'].astext.in_(params['info_controls'])
         )
     
-    # Boolean filters
+    # Boolean filters for has_mitre
     if params['has_mitre'] is not None:
         if params['has_mitre']:
             query = query.filter(
@@ -159,6 +213,7 @@ def apply_search_filters(query, params: Dict[str, Any]):
                 )
             )
     
+    # Boolean filters for has_cves
     if params['has_cves'] is not None:
         if params['has_cves']:
             query = query.filter(
@@ -256,61 +311,80 @@ def serialize_rule_summary(rule, mitre_technique_ids, cve_ids):
         'extracted_cve_count': len(cve_ids)
     }
 
+# api-handler/endpoints/rules_fixed.py
+"""
+Fixed rule details serialization for CrowdStrike and other edge cases
+"""
+
 def serialize_rule_detail(rule, mitre_techniques, cve_references):
-    """Serialize rule with full metadata for detail view"""
+    """Serialize rule with full metadata for detail view - handles edge cases"""
     platforms = []
     metadata = rule.rule_metadata or {}
     
     if metadata:
         platforms = metadata.get('rule_platforms', [])
     
-    # Base rule data
+    # Safely handle source relationship
+    try:
+        rule_source_name = rule.source.name if rule.source else 'Unknown'
+    except Exception:
+        # Handle broken foreign key or missing source
+        rule_source_name = metadata.get('source_org') or rule.rule_type or 'Unknown'
+    
+    # Base rule data with safe field access
     rule_data = {
         'id': str(rule.id),
         'source_rule_id': rule.rule_id,
         'title': rule.name,
-        'description': rule.description,
+        'description': rule.description or '',
         'rule_type': rule.rule_type,
-        'severity': rule.severity or 'unknown',
+        'severity': rule.severity or 'medium',
         'status': 'active' if rule.is_active else 'inactive',
         'tags': rule.tags or [],
         'platforms': platforms,
         'rule_platforms': platforms,
         'created_date': rule.created_date.isoformat() if rule.created_date else None,
         'modified_date': rule.updated_date.isoformat() if rule.updated_date else None,
-        'rule_source': rule.source.name if rule.source else rule.rule_type or '',
+        'rule_source': rule_source_name,
         'has_mitre_mapping': len(mitre_techniques) > 0,
         'has_cve_references': len(cve_references) > 0,
         'enrichment_score': calculate_enrichment_score(rule, len(mitre_techniques), len(cve_references)),
-        'linked_technique_ids': [t['technique_id'] for t in mitre_techniques],
-        
-        # Detailed fields
-        'raw_rule': json.loads(rule.rule_content) if rule.rule_content else None,
+        'linked_technique_ids': [t.get('technique_id') for t in mitre_techniques if t.get('technique_id')],
         'linked_techniques': mitre_techniques,
-        'mitre_techniques': mitre_techniques,
-        'cve_references': cve_references,
-        'rule_content': rule.rule_content,
-        'rule_metadata': metadata,
-        
-        # New metadata fields
-        'author': metadata.get('author'),
-        'language': metadata.get('language'),
-        'index': metadata.get('index', []),
-        'references': metadata.get('references', []),
-        'info_controls': metadata.get('info_controls'),
-        'siem_platform': metadata.get('siem_platform'),
-        'aor': metadata.get('aor'),
-        'source_org': metadata.get('source_org', rule.source.name if rule.source else None),
-        'data_sources': metadata.get('data_sources', []),
-        'modified_by': metadata.get('modified_by'),
-        'hunt_id': metadata.get('hunt_id'),
-        'malware_family': metadata.get('malware_family'),
-        'intrusion_set': metadata.get('intrusion_set'),
-        'cwe_ids': metadata.get('cwe_ids', []),
-        'validation': metadata.get('validation', {})
     }
     
+    # Extended metadata fields with safe access
+    rule_data['author'] = metadata.get('author')
+    rule_data['source_file_path'] = rule.source_file_path if hasattr(rule, 'source_file_path') else None
+    rule_data['raw_rule'] = None  # Don't expose raw rule content by default
+    rule_data['rule_content'] = rule.rule_content if rule.rule_content else None
+    rule_data['rule_metadata'] = metadata
+    
+    # Platform-specific details with safe access
+    rule_data['elastic_details'] = rule.elastic_details if hasattr(rule, 'elastic_details') else None
+    rule_data['sentinel_details'] = rule.sentinel_details if hasattr(rule, 'sentinel_details') else None
+    rule_data['trinitycyber_details'] = rule.trinity_cyber_details if hasattr(rule, 'trinity_cyber_details') else None
+    
+    # Enrichment data
+    rule_data['mitre_techniques'] = mitre_techniques
+    rule_data['cve_references'] = cve_references
+    rule_data['related_rules'] = []
+    
+    # New metadata fields from enhanced processors
+    rule_data['siem_platform'] = metadata.get('siem_platform')
+    rule_data['aor'] = metadata.get('aor')
+    rule_data['source_org'] = metadata.get('source_org')
+    rule_data['data_sources'] = metadata.get('data_sources', [])
+    rule_data['info_controls'] = metadata.get('info_controls')
+    rule_data['modified_by'] = metadata.get('modified_by')
+    rule_data['hunt_id'] = metadata.get('hunt_id')
+    rule_data['malware_family'] = metadata.get('malware_family')
+    rule_data['intrusion_set'] = metadata.get('intrusion_set')
+    rule_data['cwe_ids'] = metadata.get('cwe_ids', [])
+    rule_data['validation'] = metadata.get('validation', {})
+    
     return rule_data
+
 
 def search_rules(params: Dict[str, Any]) -> Dict[str, Any]:
     """Search and filter rules"""
@@ -361,54 +435,79 @@ def search_rules(params: Dict[str, Any]) -> Dict[str, Any]:
         return create_error_response(500, "Failed to search rules")
 
 def get_rule_details(rule_id: str) -> Dict[str, Any]:
-    """Get detailed rule information"""
+    """Get detailed rule information with better error handling"""
     try:
+        # Try parsing as integer ID first
         try:
             db_id = int(rule_id)
             id_filter = DetectionRule.id == db_id
         except ValueError:
+            # Fall back to string rule_id
             id_filter = DetectionRule.rule_id == rule_id
         
         with db_session() as session:
+            # Use left outer joins to handle missing relationships
             rule = session.query(DetectionRule).options(
-                joinedload(DetectionRule.source),
-                selectinload(DetectionRule.mitre_mappings).joinedload(RuleMitreMapping.technique),
-                selectinload(DetectionRule.cve_mappings).joinedload(RuleCveMapping.cve)
+                selectinload(DetectionRule.source),  # Load source separately
+                selectinload(DetectionRule.mitre_mappings).selectinload(RuleMitreMapping.technique),
+                selectinload(DetectionRule.cve_mappings).selectinload(RuleCveMapping.cve)
             ).filter(id_filter).first()
             
             if not rule:
                 return create_error_response(404, f"Rule not found: {rule_id}")
             
-            # Build MITRE techniques list
+            # Build MITRE techniques list with safe access
             mitre_techniques = []
-            for mapping in rule.mitre_mappings:
-                if mapping.technique:
-                    mitre_techniques.append({
-                        'technique_id': mapping.technique.technique_id,
-                        'name': mapping.technique.name,
-                        'description': mapping.technique.description,
-                        'confidence': float(mapping.mapping_confidence) if mapping.mapping_confidence else 1.0
-                    })
+            if rule.mitre_mappings:
+                for mapping in rule.mitre_mappings:
+                    try:
+                        if mapping.technique:
+                            mitre_techniques.append({
+                                'technique_id': mapping.technique.technique_id,
+                                'name': mapping.technique.name,
+                                'description': mapping.technique.description[:500] if mapping.technique.description else '',
+                                'confidence': float(mapping.mapping_confidence) if mapping.mapping_confidence else 1.0
+                            })
+                    except Exception as e:
+                        logger.warning(f"Error processing MITRE mapping for rule {rule_id}: {e}")
             
-            # Build CVE references list
+            # Build CVE references list with safe access
             cve_references = []
-            for mapping in rule.cve_mappings:
-                if mapping.cve:
-                    cve_references.append({
-                        'cve_id': mapping.cve.cve_id,
-                        'description': mapping.cve.description,
-                        'severity': mapping.cve.severity,
-                        'cvss_v3_score': float(mapping.cve.cvss_v3_score) if mapping.cve.cvss_v3_score else None,
-                        'published_date': mapping.cve.published_date.isoformat() if mapping.cve.published_date else None
-                    })
+            if rule.cve_mappings:
+                for mapping in rule.cve_mappings:
+                    try:
+                        if mapping.cve:
+                            cve_references.append({
+                                'cve_id': mapping.cve.cve_id,
+                                'description': mapping.cve.description[:500] if mapping.cve.description else '',
+                                'severity': mapping.cve.severity,
+                                'cvss_v3_score': float(mapping.cve.cvss_v3_score) if mapping.cve.cvss_v3_score else None,
+                                'published_date': mapping.cve.published_date.isoformat() if mapping.cve.published_date else None
+                            })
+                    except Exception as e:
+                        logger.warning(f"Error processing CVE mapping for rule {rule_id}: {e}")
             
-            response_data = serialize_rule_detail(rule, mitre_techniques, cve_references)
-            
-            return create_api_response(200, response_data)
+            # Serialize with enhanced error handling
+            try:
+                response_data = serialize_rule_detail(rule, mitre_techniques, cve_references)
+                return create_api_response(200, response_data)
+            except Exception as e:
+                logger.error(f"Error serializing rule {rule_id}: {e}", exc_info=True)
+                # Return minimal safe response
+                return create_api_response(200, {
+                    'id': str(rule.id),
+                    'source_rule_id': rule.rule_id,
+                    'title': rule.name or 'Unknown',
+                    'description': rule.description or '',
+                    'rule_type': rule.rule_type or 'unknown',
+                    'severity': rule.severity or 'medium',
+                    'status': 'active' if rule.is_active else 'inactive',
+                    'error_note': 'Some rule details could not be loaded'
+                })
             
     except Exception as e:
-        logger.error(f"Error getting rule details: {e}", exc_info=True)
-        return create_error_response(500, "Failed to get rule details")
+        logger.error(f"Error getting rule details for {rule_id}: {e}", exc_info=True)
+        return create_error_response(500, f"Failed to get rule details: {str(e)}")
 
 def get_filter_options(params: Dict[str, Any]) -> Dict[str, Any]:
     """Get available filter options with counts"""

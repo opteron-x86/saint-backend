@@ -1,7 +1,6 @@
 # elastic_rule_processor.py
 """
-Enhanced Elastic Detection Rule Processor for SAINT
-Extracts and stores comprehensive metadata including new required fields
+Elastic Detection Rule Processor
 """
 
 import json

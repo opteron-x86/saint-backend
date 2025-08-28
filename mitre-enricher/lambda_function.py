@@ -1,14 +1,6 @@
 # mitre_enricher.py
 """
 SAINT MITRE Enricher Lambda
-Scans rules for MITRE ATT&CK technique references and creates mappings.
-
-Features:
-- Pattern-based technique extraction from rule content, names, descriptions, tags
-- Validation against MITRE database
-- Confidence scoring for different extraction methods
-- Batch processing for efficiency
-- Comprehensive logging and metrics
 """
 import json
 import logging
@@ -19,12 +11,10 @@ from datetime import datetime
 from saint_datamodel import db_session
 from saint_datamodel.models import DetectionRule, MitreTechnique, RuleMitreMapping
 
-# Setup logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 class MitreEnricher:
-    # Enhanced MITRE technique patterns
     TECHNIQUE_ID_PATTERN = re.compile(r'T(\d{4})(?:\.(\d{3}))?', re.IGNORECASE)
     
     # Common MITRE technique patterns in rule content
@@ -34,27 +24,20 @@ class MitreEnricher:
         'attack_reference': re.compile(r'att&ck.*T\d{4}', re.IGNORECASE),
         'technique_context': re.compile(r'technique\s+T\d{4}', re.IGNORECASE)
     }
-    
-    # No hardcoded mappings - we'll use the complete MITRE database instead
-    
+        
     def __init__(self):
         self.processed_count = 0
         self.mappings_created = 0
         self.mappings_updated = 0
         self.techniques_found = 0
         self.confidence_scores = []
-        # Cache for database techniques - load once, use many times
         self._technique_cache = None
         self._technique_name_lookup = None
         
     def enrich_rules(self, rule_ids: List[int] = None) -> Dict[str, Any]:
-        """
-        Main enrichment method - scans rules and creates MITRE mappings.
-        """
         logger.info(f"Starting MITRE enrichment for {len(rule_ids) if rule_ids else 'all'} rules")
         
         with db_session() as session:
-            # Get rules to process
             rules = self._get_rules_to_process(session, rule_ids)
             
             if not rules:
@@ -63,12 +46,11 @@ class MitreEnricher:
             
             logger.info(f"Processing {len(rules)} rules for MITRE enrichment")
             
-            # Load MITRE techniques for validation
             valid_techniques = self._load_valid_techniques(session)
             logger.info(f"Loaded {len(valid_techniques)} valid MITRE techniques")
             
-            # Process rules in smaller batches to avoid timeouts
-            batch_size = 25  # Reduced from 50 to avoid timeouts
+            # Process rules in batches
+            batch_size = 100 
             for i in range(0, len(rules), batch_size):
                 batch = rules[i:i + batch_size]
                 self._process_rule_batch(batch, valid_techniques, session)
@@ -162,7 +144,6 @@ class MitreEnricher:
     
     def _enrich_single_rule(self, rule: DetectionRule, valid_techniques: Dict[str, MitreTechnique], session):
         """Enrich a single rule with MITRE technique mappings."""
-        # Extract techniques from all available sources
         extracted_techniques = self._extract_techniques_from_rule(rule)
         
         if not extracted_techniques:
@@ -301,10 +282,9 @@ class MitreEnricher:
         return techniques
     
     def _find_techniques_using_cache(self, text: str) -> List[Dict[str, Any]]:
-        """Find MITRE techniques using prebuilt cache - much faster than database queries."""
+        """Find MITRE techniques using prebuilt cache"""
         matches = []
         
-        # Check cached lookups (very fast - no database queries)
         for lookup_term, technique_info in self._technique_name_lookup.items():
             if lookup_term in text:
                 matches.append({
@@ -338,7 +318,7 @@ class MitreEnricher:
                 for technique_id in extracted:
                     techniques.append({
                         'id': technique_id.upper(),
-                        'confidence': 0.95,  # High confidence for previously extracted
+                        'confidence': 0.95,
                         'source': 'metadata_extracted'
                     })
         

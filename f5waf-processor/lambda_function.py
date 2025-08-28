@@ -1,352 +1,412 @@
-# f5_waf_processor.py
+# f5_waf_processor_enhanced.py
 """
-Processes F5 WAF attack signatures from JSON files in S3.
-- Maps F5 attack signatures to the SAINT database schema
-- Creates mappings between attack signatures and MITRE ATT&CK techniques
-- Extracts CVE data for processing by the CVE updater
+Enhanced F5 WAF Detection Rule Processor
 """
 import json
 import logging
 import re
 import boto3
-from typing import Dict, List, Any, Optional, Set
+from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
 
-# Import from the saint-datamodel layer
-from saint_datamodel import db_session, RuleRepository, MitreRepository
-from saint_datamodel.models import RuleSource, DetectionRule, RuleMitreMapping
-from saint_datamodel.utils import generate_rule_hash
+from saint_datamodel import db_session, RuleRepository
+from saint_datamodel.models import RuleSource, DetectionRule
+from saint_datamodel.utils import generate_rule_hash, normalize_metadata
 
-# --- Logging and Clients ---
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
 s3_client = boto3.client('s3')
+lambda_client = boto3.client('lambda')
 
-# Regex patterns for extraction
-MITRE_TECHNIQUE_REGEX = re.compile(r'T(\d{4})(?:\.(\d{3}))?', re.IGNORECASE)
-CVE_REGEX = re.compile(r'CVE-\d{4}-\d{4,}', re.IGNORECASE)
 
-# Attack type to MITRE technique mapping (common patterns)
-ATTACK_TYPE_MITRE_MAPPING = {
-    'Server Side Code Injection': ['T1190'],  # Exploit Public-Facing Application
-    'SQL Injection': ['T1190'],  # Exploit Public-Facing Application  
-    'Cross Site Scripting (XSS)': ['T1190'],  # Exploit Public-Facing Application
-    'Command Execution': ['T1059'],  # Command and Scripting Interpreter
-    'Directory Traversal': ['T1083'],  # File and Directory Discovery
-    'Information Leakage': ['T1083'],  # File and Directory Discovery
-    'Detection Evasion': ['T1055'],  # Process Injection
-    'Remote File Inclusion': ['T1105'],  # Ingress Tool Transfer
-    'Local File Inclusion': ['T1083'],  # File and Directory Discovery
-    'XML External Entity (XXE)': ['T1190'],  # Exploit Public-Facing Application
-    'Server-Side Request Forgery (SSRF)': ['T1190'],  # Exploit Public-Facing Application
-}
-
-def is_valid_mitre_technique_id(technique_id: str) -> bool:
-    """Validate if a technique ID is within MITRE ATT&CK Enterprise ranges."""
-    match = re.match(r'^T(\d{4})(?:\.(\d{3}))?$', technique_id.upper())
-    if not match:
-        return False
-    
-    main_id = int(match.group(1))
-    sub_id = match.group(2)
-    
-    # MITRE ATT&CK Enterprise uses T1xxx range primarily
-    if 1000 <= main_id <= 1700:  # Generous range covering current and future techniques
-        if sub_id:
-            sub_num = int(sub_id)
-            return 1 <= sub_num <= 999
-        return True
-    
-    return False
-
-class F5WAFProcessor:
+class F5WafProcessor:
     SOURCE_NAME = "F5 WAF"
-
+    
+    # Attack type to MITRE tactic mapping
+    ATTACK_TYPE_TO_TACTIC = {
+        'Cross Site Scripting (XSS)': 'Initial Access',
+        'SQL Injection': 'Initial Access',
+        'Command Injection': 'Execution',
+        'Remote File Include': 'Execution',
+        'Local File Include': 'Collection',
+        'Directory Traversal': 'Discovery',
+        'Buffer Overflow': 'Privilege Escalation',
+        'XML External Entity': 'Collection',
+        'Server Side Request Forgery': 'Lateral Movement',
+        'Denial of Service': 'Impact',
+        'Authentication Bypass': 'Defense Evasion',
+        'Session Hijacking': 'Credential Access',
+        'Information Disclosure': 'Collection',
+        'Code Injection': 'Execution',
+        'LDAP Injection': 'Initial Access'
+    }
+    
     def __init__(self):
         self.processed_count = 0
         self.created_count = 0
         self.updated_count = 0
-        self.mitre_mappings_created = 0
-        self.cve_references_extracted = 0
+        self.skipped_count = 0
         self.error_count = 0
-
+        self.processed_rule_ids = []
+        
     def get_or_create_source(self, session) -> RuleSource:
-        """Gets or creates the 'F5 WAF' RuleSource."""
         source = session.query(RuleSource).filter_by(name=self.SOURCE_NAME).first()
         if source:
             return source
+            
         new_source = RuleSource(
             name=self.SOURCE_NAME,
-            description="Attack signatures from F5 Distributed Cloud Web Application Firewall.",
-            source_type="Vendor",
-            base_url="https://docs.cloud.f5.com"
+            description="Web Application Firewall signatures from F5 Networks",
+            source_type="WAF",
+            base_url="https://support.f5.com"
         )
         session.add(new_source)
         session.flush()
         return new_source
-
-    def extract_attack_signatures_from_json(self, json_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        Extract attack signatures from the F5 WAF JSON structure.
-        The signatures are nested in pageProps.docData.scope.JsonData
-        """
-        try:
-            # Navigate the nested JSON structure
-            page_props = json_data.get('pageProps', {})
-            doc_data = page_props.get('docData', {})
-            scope = doc_data.get('scope', {})
-            signatures = scope.get('JsonData', [])
+    
+    def _extract_metadata(self, rule_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract comprehensive metadata from F5 rule data"""
+        
+        attack_type = rule_data.get('attack_type', '')
+        systems = rule_data.get('systems', [])
+        
+        metadata = {
+            # Core fields
+            'rule_format': 'f5_waf',
+            'source_type': 'waf',
+            'processor_version': '3.0_enhanced',
+            'needs_enrichment': True,
             
-            if not signatures:
-                logger.warning("No attack signatures found in JSON data")
-                return []
+            # Required metadata fields
+            'siem_platform': 'F5 Advanced WAF',
+            'source_org': 'F5 Networks',
+            'aor': 'Network Perimeter',  # WAF rules protect perimeter
+            'info_controls': 'TLP:WHITE',
+            'author': 'F5 Security Research',
+            'language': 'waf_signature',
             
-            logger.info(f"Extracted {len(signatures)} attack signatures from JSON")
-            return signatures
+            # Data sources
+            'data_sources': self._extract_data_sources(rule_data),
             
-        except Exception as e:
-            logger.error(f"Failed to extract attack signatures from JSON: {e}")
-            return []
-
-    def _extract_mitre_techniques_from_signature(self, signature: Dict[str, Any]) -> Set[str]:
-        """Extract MITRE technique IDs from attack signature data."""
-        techniques = set()
-        
-        # 1. Look for explicit MITRE references in description
-        description = signature.get('description', '') or ''
-        matches = MITRE_TECHNIQUE_REGEX.findall(description)
-        for match in matches:
-            technique_id = f"T{match[0]}"
-            if match[1]:  # Sub-technique
-                technique_id += f".{match[1]}"
-            if is_valid_mitre_technique_id(technique_id):
-                techniques.add(technique_id.upper())
-        
-        # 2. Map attack type to common MITRE techniques
-        attack_type = signature.get('attack_type', '') or ''
-        if attack_type in ATTACK_TYPE_MITRE_MAPPING:
-            for technique in ATTACK_TYPE_MITRE_MAPPING[attack_type]:
-                techniques.add(technique)
-        
-        # 3. Look for MITRE references in signature references (with null check)
-        references = signature.get('references')
-        if references:  # Only iterate if references is not None
-            for ref in references:
-                if isinstance(ref, str):
-                    matches = MITRE_TECHNIQUE_REGEX.findall(ref)
-                    for match in matches:
-                        technique_id = f"T{match[0]}"
-                        if match[1]:
-                            technique_id += f".{match[1]}"
-                        if is_valid_mitre_technique_id(technique_id):
-                            techniques.add(technique_id.upper())
-        
-        return techniques
-
-    def _extract_cve_references(self, signature: Dict[str, Any]) -> Set[str]:
-        """Extract CVE IDs from F5 attack signature data."""
-        cves = set()
-        
-        # Extract from references array (with null check)
-        references = signature.get('references')
-        if references:  # Only iterate if references is not None
-            for ref in references:
-                if isinstance(ref, str):
-                    matches = CVE_REGEX.findall(ref)
-                    cves.update(cve.upper() for cve in matches)
-        
-        # Extract from description
-        description = signature.get('description', '') or ''
-        matches = CVE_REGEX.findall(description)
-        cves.update(cve.upper() for cve in matches)
-        
-        return cves
-
-    def _map_and_upsert_rule(self, signature: Dict[str, Any], rule_repo: RuleRepository, source_id: int) -> Optional[DetectionRule]:
-        """Map F5 attack signature to DetectionRule and upsert to database."""
-        try:
-            # Parse last_update timestamp
-            last_update_str = signature.get('last_update', '')
-            try:
-                last_update = datetime.strptime(last_update_str, '%Y/%m/%d %H:%M:%S')
-                last_update = last_update.replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
-                last_update = datetime.now(timezone.utc)
+            # F5-specific fields
+            'signature_id': rule_data.get('id'),
+            'attack_type': attack_type,
+            'risk_level': rule_data.get('risk', 'Medium'),
+            'accuracy': rule_data.get('accuracy', 'Medium'),
+            'applies_to': rule_data.get('applies_to', 'Request'),
+            'target_systems': systems,
+            'last_update': rule_data.get('last_update'),
             
-            # Build rule content from signature data
-            rule_content = {
-                'signature_id': signature.get('id'),
-                'attack_type': signature.get('attack_type'),
-                'risk': signature.get('risk'),
-                'accuracy': signature.get('accuracy'),
-                'applies_to': signature.get('applies_to'),
-                'systems': signature.get('systems', []),
-                'description': signature.get('description'),
-                'references': signature.get('references', []) or []  # Handle None case
+            # Enhanced threat intel
+            'mitre_tactic': self.ATTACK_TYPE_TO_TACTIC.get(attack_type),
+            'references': rule_data.get('references', '').split('\n') if rule_data.get('references') else [],
+            
+            # Validation info
+            'validation': {
+                'testable_via': 'F5 WAF',
+                'accuracy': rule_data.get('accuracy', 'Medium'),
+                'false_positive_rate': 'High' if rule_data.get('accuracy') == 'Low' else 'Medium',
+                'validated': True,
+                'last_tested': rule_data.get('last_update')
             }
-            
-            # Create rule data for database - using only fields that exist on DetectionRule model
-            rule_data = {
-                'rule_id': str(signature['id']),
-                'name': signature.get('name', f"F5 Attack Signature {signature['id']}"),
-                'description': signature.get('description', ''),
-                'rule_content': json.dumps(rule_content),
-                'rule_type': 'attack_signature',
-                'severity': self._map_risk_to_severity(signature.get('risk', 'Medium')),
-                'source_id': source_id,
-                'rule_metadata': {
-                    'attack_type': signature.get('attack_type'),
-                    'risk': signature.get('risk'),
-                    'accuracy': signature.get('accuracy'),
-                    'applies_to': signature.get('applies_to'),
-                    'systems': signature.get('systems', []),
-                    'last_update': last_update_str
-                }
-            }
-            
-            # Generate hash for comparison
-            rule_hash = generate_rule_hash(rule_data['rule_content'])
-            rule_data['hash'] = rule_hash
-            
-            # Upsert rule
-            existing_rule = rule_repo.get_by_source_and_rule_id(source_id, rule_data['rule_id'])
-            if existing_rule:
-                # Compare hash to see if rule has changed
-                if existing_rule.hash != rule_hash:
-                    logger.debug(f"Updating rule {rule_data['rule_id']}")
-                    for key, value in rule_data.items():
-                        setattr(existing_rule, key, value)
-                    self.updated_count += 1
-                    return existing_rule
-                else:
-                    logger.debug(f"Rule {rule_data['rule_id']} unchanged")
-                    return existing_rule
-            else:
-                logger.debug(f"Creating new rule {rule_data['rule_id']}")
-                new_rule = DetectionRule(**rule_data)
-                rule_repo.session.add(new_rule)
-                rule_repo.session.flush()
-                self.created_count += 1
-                return new_rule
-                
-        except Exception as e:
-            logger.error(f"Failed to map attack signature {signature.get('id')}: {e}", exc_info=True)
-            return None
-
-    def _map_risk_to_severity(self, risk: str) -> str:
-        """Map F5 risk levels to standard severity levels."""
-        risk_mapping = {
-            'Low': 'low',
-            'Medium': 'medium',
-            'High': 'high',
-            'Critical': 'critical'
         }
-        return risk_mapping.get(risk, 'medium')
-
-    def _map_mitre_techniques(self, db_rule: DetectionRule, signature: Dict[str, Any], mitre_repo: MitreRepository):
-        """Create MITRE technique mappings for the rule."""
-        techniques = self._extract_mitre_techniques_from_signature(signature)
         
-        for technique_id in techniques:
-            try:
-                mitre_technique = mitre_repo.get_technique_by_id(technique_id)
-                if not mitre_technique:
-                    logger.warning(f"MITRE technique {technique_id} not found in database")
-                    continue
+        # Extract CVE/CWE from description
+        description = rule_data.get('description', '')
+        metadata['cve_ids'] = self._extract_cve_refs(description)
+        metadata['cwe_ids'] = self._extract_cwe_refs(description)
+        
+        # Extract malware if mentioned
+        metadata['malware_family'] = self._extract_malware(description)
+        
+        return metadata
+    
+    def _extract_data_sources(self, rule_data: Dict[str, Any]) -> List[str]:
+        """Determine data sources based on rule configuration"""
+        data_sources = ['Web Application Traffic', 'HTTP/HTTPS Logs']
+        
+        applies_to = rule_data.get('applies_to', '')
+        if 'Request' in applies_to:
+            data_sources.append('HTTP Request Headers')
+            data_sources.append('HTTP Request Body')
+        if 'Response' in applies_to:
+            data_sources.append('HTTP Response Headers')
+            data_sources.append('HTTP Response Body')
+        if 'Cookie' in applies_to:
+            data_sources.append('HTTP Cookies')
+            
+        # Add based on attack type
+        attack_type = rule_data.get('attack_type', '')
+        if 'SQL' in attack_type:
+            data_sources.append('Database Query Logs')
+        if 'File' in attack_type:
+            data_sources.append('File Access Logs')
+        if 'XML' in attack_type:
+            data_sources.append('XML Parser Logs')
+            
+        return list(set(data_sources))
+    
+    def _extract_cve_refs(self, text: str) -> List[str]:
+        """Extract CVE references from text"""
+        pattern = r'CVE-\d{4}-\d{4,}'
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        return [match.upper() for match in matches]
+    
+    def _extract_cwe_refs(self, text: str) -> List[str]:
+        """Extract CWE references from text"""
+        # Map attack types to CWE IDs
+        attack_to_cwe = {
+            'Cross Site Scripting': ['CWE-79'],
+            'SQL Injection': ['CWE-89'],
+            'Command Injection': ['CWE-77', 'CWE-78'],
+            'Directory Traversal': ['CWE-22'],
+            'Buffer Overflow': ['CWE-120'],
+            'XML External Entity': ['CWE-611'],
+            'LDAP Injection': ['CWE-90']
+        }
+        
+        cwe_ids = []
+        for attack_type, cwes in attack_to_cwe.items():
+            if attack_type in text:
+                cwe_ids.extend(cwes)
                 
-                # Check if mapping already exists
-                existing_mapping = mitre_repo.session.query(RuleMitreMapping).filter_by(
-                    rule_id=db_rule.id,
-                    technique_id=mitre_technique.id
-                ).first()
+        # Also search for explicit CWE references
+        pattern = r'CWE-\d+'
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        cwe_ids.extend([match.upper() for match in matches])
+        
+        return list(set(cwe_ids))
+    
+    def _extract_malware(self, text: str) -> Optional[str]:
+        """Extract malware family if mentioned"""
+        malware_patterns = [
+            'backdoor', 'trojan', 'ransomware', 'worm', 'rootkit',
+            'botnet', 'webshell', 'cryptominer', 'stealer'
+        ]
+        
+        text_lower = text.lower()
+        for pattern in malware_patterns:
+            if pattern in text_lower:
+                return pattern.capitalize()
+        return None
+    
+    def _build_tags(self, rule_data: Dict[str, Any], metadata: Dict[str, Any]) -> List[str]:
+        """Build comprehensive tags"""
+        tags = ['source:f5_waf']
+        
+        # Attack type
+        attack_type = rule_data.get('attack_type', '')
+        if attack_type:
+            tags.append(f"attack:{attack_type.lower().replace(' ', '_').replace('(', '').replace(')', '')}")
+        
+        # Risk level
+        risk = rule_data.get('risk', 'medium').lower()
+        tags.append(f"severity:{risk}")
+        
+        # Accuracy
+        accuracy = rule_data.get('accuracy', 'medium').lower()
+        tags.append(f"accuracy:{accuracy}")
+        
+        # Target systems
+        for system in rule_data.get('systems', []):
+            tags.append(f"target:{system.lower().replace(' ', '_')}")
+        
+        # MITRE tactic if mapped
+        if metadata.get('mitre_tactic'):
+            tags.append(f"tactic:{metadata['mitre_tactic'].lower().replace(' ', '_')}")
+        
+        # Apply scope
+        applies_to = rule_data.get('applies_to', '').lower()
+        if applies_to:
+            tags.append(f"scope:{applies_to}")
+        
+        tags.append('aor:network_perimeter')
+        tags.append('type:waf_signature')
+        
+        return tags
+    
+    def _determine_severity(self, rule_data: Dict[str, Any]) -> str:
+        """Map F5 risk level to standard severity"""
+        risk = rule_data.get('risk', 'Medium').lower()
+        severity_map = {
+            'critical': 'critical',
+            'high': 'high',
+            'medium': 'medium',
+            'low': 'low',
+            'informational': 'low'
+        }
+        return severity_map.get(risk, 'medium')
+    
+    def process_rules(self, rules_data: List[Dict[str, Any]], source_id: int):
+        """Process F5 rules into database"""
+        with db_session() as session:
+            rule_repo = RuleRepository(session)
+            
+            for rule_data in rules_data:
+                self.processed_count += 1
                 
-                if not existing_mapping:
-                    mapping = RuleMitreMapping(
-                        rule_id=db_rule.id,
-                        technique_id=mitre_technique.id,
-                        mapping_source=self.SOURCE_NAME,
-                        mapping_confidence=0.8  # Default confidence for F5 mappings
-                    )
-                    mitre_repo.session.add(mapping)
-                    self.mitre_mappings_created += 1
-                    logger.debug(f"Created MITRE mapping: Rule {db_rule.rule_id} -> {technique_id}")
+                try:
+                    # Generate rule ID
+                    rule_id = f"f5_sig_{rule_data.get('id')}"
+                    rule_content = json.dumps(rule_data, sort_keys=True)
+                    rule_hash = generate_rule_hash(rule_content)
                     
-            except Exception as e:
-                logger.error(f"Failed to create MITRE mapping for {technique_id}: {e}")
-
+                    # Extract metadata and tags
+                    metadata = self._extract_metadata(rule_data)
+                    tags = self._build_tags(rule_data, metadata)
+                    
+                    # Parse description for summary
+                    description = rule_data.get('description', '')
+                    summary_match = re.search(r'Summary:\s*(.+?)(?:Impact:|$)', description, re.DOTALL)
+                    summary = summary_match.group(1).strip() if summary_match else rule_data.get('name', '')
+                    
+                    rule_payload = {
+                        'name': rule_data.get('name', ''),
+                        'description': summary[:500],
+                        'rule_content': rule_content,
+                        'rule_type': 'waf_signature',
+                        'severity': self._determine_severity(rule_data),
+                        'is_active': True,
+                        'tags': tags,
+                        'rule_metadata': normalize_metadata(metadata)
+                    }
+                    
+                    # Check if rule exists
+                    existing_rule = rule_repo.get_by_source_and_rule_id(source_id, rule_id)
+                    
+                    if existing_rule:
+                        # Check if update needed
+                        needs_update = (
+                            existing_rule.hash != rule_hash or
+                            existing_rule.rule_metadata.get('processor_version') != metadata['processor_version']
+                        )
+                        
+                        if needs_update:
+                            rule_repo.update(existing_rule.id, hash=rule_hash, **rule_payload)
+                            self.updated_count += 1
+                            logger.info(f"Updated rule: {rule_id}")
+                        else:
+                            self.skipped_count += 1
+                    else:
+                        # Create new rule
+                        db_rule = rule_repo.create(
+                            rule_id=rule_id,
+                            source_id=source_id,
+                            hash=rule_hash,
+                            **rule_payload
+                        )
+                        self.created_count += 1
+                        self.processed_rule_ids.append(db_rule.id)
+                        logger.info(f"Created rule: {rule_id}")
+                    
+                    session.commit()
+                    
+                except Exception as e:
+                    session.rollback()
+                    self.error_count += 1
+                    logger.error(f"Failed to process F5 rule {rule_data.get('id')}: {e}")
+    
     def process_s3_object(self, bucket: str, key: str):
-        """Process a single S3 object containing F5 WAF attack signatures."""
+        """Process S3 object containing F5 rules"""
         logger.info(f"Processing S3 object: s3://{bucket}/{key}")
         
         try:
+            # Download and parse JSON
             s3_object = s3_client.get_object(Bucket=bucket, Key=key)
-            file_content = s3_object['Body'].read().decode('utf-8')
+            content = s3_object['Body'].read()
             
-            # Parse JSON data
-            try:
-                json_data = json.loads(file_content)
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse JSON from {key}: {e}")
-                self.error_count += 1
+            # Parse JSON structure
+            data = json.loads(content)
+            
+            # Extract rules array from nested structure
+            if 'pageProps' in data and 'docData' in data['pageProps']:
+                rules_data = data['pageProps']['docData']['scope']['JsonData']
+            elif 'JsonData' in data:
+                rules_data = data['JsonData']
+            elif isinstance(data, list):
+                rules_data = data
+            else:
+                logger.error(f"Unknown F5 data structure in {key}")
                 return
             
-            # Extract attack signatures from nested JSON structure
-            signatures = self.extract_attack_signatures_from_json(json_data)
-            if not signatures:
-                logger.warning(f"No attack signatures found in {key}")
-                return
+            logger.info(f"Found {len(rules_data)} F5 rules to process")
             
-            logger.info(f"Processing {len(signatures)} attack signatures from {key}")
-            
+            # Get source ID
             with db_session() as session:
-                rule_repo = RuleRepository(session)
-                mitre_repo = MitreRepository(session)
-                f5_source = self.get_or_create_source(session)
+                source = self.get_or_create_source(session)
+                source_id = source.id
+                session.commit()
+            
+            # Process rules
+            self.process_rules(rules_data, source_id)
+            
+            # Trigger enrichment
+            if self.processed_rule_ids:
+                self._trigger_enrichment(source_id, self.processed_rule_ids)
                 
-                for signature in signatures:
-                    self.processed_count += 1
-                    try:
-                        logger.debug(f"Processing signature: {signature.get('id', 'unknown')}")
-                        db_rule = self._map_and_upsert_rule(signature, rule_repo, f5_source.id)
-                        if not db_rule:
-                            logger.warning(f"Failed to create/update signature: {signature.get('id', 'unknown')}")
-                            continue
-
-                        self._map_mitre_techniques(db_rule, signature, mitre_repo)
-                        
-                        # Count CVE references for metadata
-                        cve_refs = self._extract_cve_references(signature)
-                        self.cve_references_extracted += len(cve_refs)
-
-                        session.commit()
-                        logger.debug(f"Successfully processed signature: {signature.get('id', 'unknown')}")
-
-                    except Exception as e:
-                        session.rollback()
-                        self.error_count += 1
-                        logger.error(f"Failed to process signature {signature.get('id')}: {e}", exc_info=True)
-
         except Exception as e:
+            logger.error(f"Fatal error processing {key}: {e}", exc_info=True)
             self.error_count += 1
-            logger.error(f"Fatal error processing S3 object s3://{bucket}/{key}: {e}", exc_info=True)
-
+        
         logger.info(
-            f"F5 WAF processing finished. "
-            f"Signatures: {self.processed_count}, Created: {self.created_count}, Updated: {self.updated_count}, "
-            f"MITRE Mappings: {self.mitre_mappings_created}, CVE References: {self.cve_references_extracted}, "
+            f"F5 processing complete - Created: {self.created_count}, "
+            f"Updated: {self.updated_count}, Skipped: {self.skipped_count}, "
             f"Errors: {self.error_count}"
         )
+    
+    def _trigger_enrichment(self, source_id: int, rule_ids: List[int]):
+        """Trigger enrichment orchestrator"""
+        try:
+            payload = {
+                'source_completed': True,
+                'source_id': source_id,
+                'rule_ids': rule_ids,
+                'source_name': self.SOURCE_NAME,
+                'processor_version': '3.0_enhanced'
+            }
+            
+            lambda_client.invoke(
+                FunctionName='saint-enrichment-orchestrator',
+                InvocationType='Event',
+                Payload=json.dumps(payload)
+            )
+            
+            logger.info(f"Triggered enrichment for {len(rule_ids)} F5 rules")
+            
+        except Exception as e:
+            logger.error(f"Failed to trigger enrichment: {e}")
+
 
 def lambda_handler(event, context):
-    """Main handler triggered by S3 event."""
-    processor = F5WAFProcessor()
-    for record in event.get('Records', []):
-        bucket = record['s3']['bucket']['name']
-        key = record['s3']['object']['key']
-
-        if key.startswith('f5waf/'):
-            processor.process_s3_object(bucket=bucket, key=key)
-        else:
-            logger.warning(f"Skipping file not in 'f5waf/' folder: {key}")
-
-    return {'statusCode': 200, 'body': json.dumps({'message': 'F5 WAF processing complete.'})}
+    """Lambda handler for S3 events"""
+    processor = F5WafProcessor()
+    
+    try:
+        for record in event.get('Records', []):
+            bucket = record['s3']['bucket']['name']
+            key = record['s3']['object']['key']
+            
+            if key.startswith('f5waf/') or key.startswith('f5-waf/'):
+                processor.process_s3_object(bucket, key)
+            else:
+                logger.warning(f"Skipping file not in f5waf/ folder: {key}")
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'F5 processing complete',
+                'processed': processor.processed_count,
+                'created': processor.created_count,
+                'updated': processor.updated_count,
+                'skipped': processor.skipped_count,
+                'errors': processor.error_count
+            })
+        }
+        
+    except Exception as e:
+        logger.error(f"Lambda handler error: {e}", exc_info=True)
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }

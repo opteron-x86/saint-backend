@@ -1,7 +1,6 @@
 # endpoints/mitre.py
 """
-Enhanced endpoint handlers for MITRE ATT&CK data.
-Works with improved data processing and avoids problematic imports.
+Endpoint handlers for MITRE ATT&CK data.
 """
 
 import logging
@@ -21,7 +20,6 @@ logger = logging.getLogger(__name__)
 def get_mitre_matrix(params: Dict[str, Any]) -> Dict[str, Any]:
     """
     Get the full ATT&CK matrix data with tactics containing nested techniques.
-    Enhanced to work with improved data structure.
     """
     try:
         with db_session() as session:
@@ -98,14 +96,23 @@ def get_mitre_matrix(params: Dict[str, Any]) -> Dict[str, Any]:
         logger.error(f"Error fetching MITRE matrix: {e}", exc_info=True)
         return create_error_response(500, "Failed to fetch MITRE matrix data")
 
+
 def get_coverage_analysis(params: Dict[str, Any]) -> Dict[str, Any]:
     """
     Get rule coverage analysis for MITRE techniques.
-    Enhanced to work with both mappings and metadata.
     """
     try:
         platforms = params.get('platforms', [])
-        include_details = params.get('include_details', 'true').lower() == 'true'
+        
+        # Handle include_details parameter - might be a list from multiValueQueryStringParameters
+        include_details_param = params.get('include_details', 'false')
+        if isinstance(include_details_param, list):
+            include_details_param = include_details_param[0] if include_details_param else 'false'
+        include_details = str(include_details_param).lower() == 'true'
+        
+        # Add pagination support
+        offset = params.get('offset', 0)
+        limit = params.get('limit', 0)  # 0 means no limit
         
         with db_session() as session:
             # Base query for all techniques
@@ -133,7 +140,7 @@ def get_coverage_analysis(params: Dict[str, Any]) -> Dict[str, Any]:
                     .all()
                 )
                 
-                # Get rules via metadata (extracted techniques)
+                # Get rules via metadata (extracted techniques)  
                 metadata_rules = (
                     session.query(DetectionRule)
                     .filter(
@@ -161,8 +168,9 @@ def get_coverage_analysis(params: Dict[str, Any]) -> Dict[str, Any]:
                     'platforms': technique.platforms or []
                 }
                 
-                # Add rule details if requested
+                # Add rule details if requested, but limit to 10 rules per technique
                 if include_details and rule_count > 0:
+                    rules_list = list(all_rules.values())[:10]  # Limit to 10 rules
                     technique_data['rules'] = [
                         {
                             'id': rule.id,
@@ -170,8 +178,12 @@ def get_coverage_analysis(params: Dict[str, Any]) -> Dict[str, Any]:
                             'severity': rule.severity,
                             'source': rule.source.name if rule.source else 'Unknown'
                         }
-                        for rule in all_rules.values()
+                        for rule in rules_list
                     ]
+                    # Indicate if there are more rules
+                    if rule_count > 10:
+                        technique_data['has_more_rules'] = True
+                        technique_data['total_rules'] = rule_count
                 else:
                     technique_data['rules'] = []
                 
@@ -183,11 +195,19 @@ def get_coverage_analysis(params: Dict[str, Any]) -> Dict[str, Any]:
             # Sort by coverage count (most covered first)
             coverage_data.sort(key=lambda x: x['count'], reverse=True)
             
+            # Apply pagination if requested
+            if limit > 0:
+                paginated_data = coverage_data[offset:offset + limit]
+            else:
+                # Even without explicit pagination, limit to prevent huge responses
+                # Return top 500 techniques to avoid response size issues
+                paginated_data = coverage_data[:500]
+            
             response_data = {
                 'total_techniques': total_techniques,
                 'covered_techniques': covered_techniques,
                 'coverage_percentage': round(coverage_percentage, 2),
-                'techniques': coverage_data,
+                'techniques': paginated_data,
                 'coverage_levels': {
                     'none': len([t for t in coverage_data if t['coverage_level'] == 'none']),
                     'low': len([t for t in coverage_data if t['coverage_level'] == 'low']),
@@ -195,6 +215,15 @@ def get_coverage_analysis(params: Dict[str, Any]) -> Dict[str, Any]:
                     'high': len([t for t in coverage_data if t['coverage_level'] == 'high'])
                 }
             }
+            
+            # Add pagination metadata if applicable
+            if limit > 0:
+                response_data['pagination'] = {
+                    'offset': offset,
+                    'limit': limit,
+                    'total': len(coverage_data),
+                    'has_more': (offset + limit) < len(coverage_data)
+                }
             
             return create_api_response(200, response_data)
 

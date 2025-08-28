@@ -1,7 +1,6 @@
 # endpoints/cve.py
 """
 Enhanced endpoint handlers for CVE data.
-Works with improved CVE processing and extraction.
 """
 
 import logging

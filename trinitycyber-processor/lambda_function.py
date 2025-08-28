@@ -1,7 +1,6 @@
 # trinity_cyber_processor_enhanced.py
 """
-Enhanced Trinity Cyber Detection Rule Processor for SAINT
-Extracts and stores comprehensive metadata matching Elastic processor requirements
+Trinity Cyber Detection Rule Processor 
 """
 
 import json
@@ -436,7 +435,7 @@ class TrinityCyberProcessor:
         return db_rule
 
     def process_s3_object(self, bucket: str, key: str):
-        """Main processing logic for the S3 file with enhanced metadata extraction"""
+        """Main processing logic for the S3 file"""
         logger.info(f"Processing S3 object: s3://{bucket}/{key}")
         
         try:
@@ -454,7 +453,6 @@ class TrinityCyberProcessor:
                         if db_rule:
                             self.processed_rule_ids.append(db_rule.id)
 
-                        # Commit each rule individually
                         session.commit()
 
                     except Exception as e:
@@ -470,7 +468,6 @@ class TrinityCyberProcessor:
             self.error_count += 1
             logger.error(f"Fatal error processing S3 object s3://{bucket}/{key}: {e}", exc_info=True)
 
-        # Log final summary
         logger.info(
             f"Trinity Cyber processing finished. "
             f"Rules processed: {self.processed_count}, Created: {self.created_count}, "
