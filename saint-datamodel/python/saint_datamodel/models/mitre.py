@@ -5,7 +5,7 @@ MITRE ATT&CK framework models
 from datetime import datetime
 from typing import List, Optional, Dict, Any, TYPE_CHECKING
 
-from sqlalchemy import Column, Integer, String, Text, ForeignKey, ARRAY
+from sqlalchemy import Column, Integer, String, Text, ForeignKey, ARRAY, Boolean, TIMESTAMP
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from sqlalchemy.dialects.postgresql import JSONB
 
@@ -46,10 +46,17 @@ class MitreTechnique(Base, TimestampMixin):
     mitigation_description: Mapped[Optional[str]] = mapped_column(Text)
     external_references: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB)
     
+    # Deprecation tracking fields
+    is_deprecated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    deprecated_date: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP)
+    superseded_by: Mapped[Optional[str]] = mapped_column(String(50))
+    deprecation_reason: Mapped[Optional[str]] = mapped_column(Text)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    version: Mapped[Optional[str]] = mapped_column(String(20))
+    
     # Relationships
     tactic: Mapped["MitreTactic"] = relationship("MitreTactic", back_populates="techniques")
     
-    # Correctly define the parent-child self-referential relationship
     parent_technique: Mapped[Optional["MitreTechnique"]] = relationship(
         "MitreTechnique", 
         remote_side=[id], 

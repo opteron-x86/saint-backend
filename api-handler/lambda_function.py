@@ -1,7 +1,4 @@
 # lambda_function.py
-"""
-Enhanced SAINT API Gateway Lambda Handler with Cognito Authentication
-"""
 
 import json
 import logging
@@ -25,16 +22,16 @@ from saint_datamodel.exceptions import NotFoundError, ValidationError, DatabaseE
 
 # Import local modules
 from api_utils.response_helpers import create_api_response, create_error_response
-from endpoints import rules, mitre, cve, filters, statistics, issues
+from endpoints import rules, mitre, cve, filters, statistics, issues, deprecated_techniques
 
 # --- Logging Setup ---
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # --- Cognito Configuration ---
-COGNITO_REGION = os.environ.get('COGNITO_REGION', 'us-gov-east-1')
-COGNITO_USER_POOL_ID = os.environ.get('COGNITO_USER_POOL_ID', 'us-gov-east-1_0eyDT5wUf')
-COGNITO_CLIENT_ID = os.environ.get('COGNITO_CLIENT_ID', '61n3kobl25jj33q074sj68got6')
+COGNITO_REGION = os.environ.get('COGNITO_REGION', '')
+COGNITO_USER_POOL_ID = os.environ.get('COGNITO_USER_POOL_ID', '')
+COGNITO_CLIENT_ID = os.environ.get('COGNITO_CLIENT_ID', '')
 DISABLE_AUTH = os.environ.get('DISABLE_AUTH', 'false').lower() == 'true'
 
 # Initialize JWT client if available and auth enabled
@@ -181,6 +178,53 @@ def handle_options_request() -> Dict[str, Any]:
         "body": json.dumps({"message": "CORS preflight"})
     })
 
+def handle_global_search(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle global search across rules, techniques, and CVEs"""
+    query = params.get('query', '').strip()
+    if not query:
+        return create_error_response(400, "Query parameter required")
+    
+    try:
+        with db_session() as session:
+            results = {
+                'rules': [],
+                'techniques': [],
+                'cves': []
+            }
+            
+            # Search rules
+            rule_results = rules.search_rules({
+                'query': query,
+                'limit': 10
+            })
+            if rule_results.get('statusCode') == 200:
+                data = json.loads(rule_results['body'])
+                results['rules'] = data.get('data', [])[:5]
+            
+            # Search techniques
+            technique_results = mitre.get_techniques_list({
+                'query': query,
+                'limit': 10
+            })
+            if technique_results.get('statusCode') == 200:
+                data = json.loads(technique_results['body'])
+                results['techniques'] = data.get('data', [])[:5]
+            
+            # Search CVEs
+            cve_results = cve.search_cves({
+                'query': query,
+                'limit': 10
+            })
+            if cve_results.get('statusCode') == 200:
+                data = json.loads(cve_results['body'])
+                results['cves'] = data.get('data', [])[:5]
+            
+            return create_api_response(200, results)
+        
+    except Exception as e:
+        logger.error(f"Error in global search: {e}", exc_info=True)
+        return create_error_response(500, "Search failed")
+
 def route_request(http_method: str, path: str, params: Dict[str, Any], event: Dict[str, Any]) -> Dict[str, Any]:
     """Route incoming requests to appropriate endpoint handlers"""
     
@@ -213,7 +257,13 @@ def route_request(http_method: str, path: str, params: Dict[str, Any], event: Di
                     "mitre_matrix": "GET /mitre/matrix - Get MITRE matrix",
                     "mitre_coverage": "GET /mitre/coverage - Get coverage",
                     "cves": "GET /cves - Search CVEs",
-                    "filters": "GET /filters/options - Get filter options"
+                    "filters": "GET /filters/options - Get filter options",
+                    "deprecated": {
+                        "statistics": "GET /deprecated/statistics - Deprecation metrics",
+                        "affected_rules": "GET /deprecated/affected-rules - List affected rules",
+                        "check_rule": "GET /deprecated/check-rule - Check specific rule",
+                        "update_mappings": "POST /deprecated/update-mappings - Update mappings"
+                    }
                 }
             })
 
@@ -273,6 +323,24 @@ def route_request(http_method: str, path: str, params: Dict[str, Any], event: Di
         if http_method == 'GET' and normalized_path == '/analytics/trends':
             return statistics.get_trend_analysis(params)
         
+        # Deprecated techniques endpoints
+        if http_method == 'GET' and normalized_path == '/deprecated/statistics':
+            return deprecated_techniques.get_deprecated_statistics(params)
+        
+        if http_method == 'GET' and normalized_path == '/deprecated/affected-rules':
+            return deprecated_techniques.get_rules_with_deprecated_techniques(params)
+        
+        if http_method == 'GET' and normalized_path == '/deprecated/check-rule':
+            # Can accept rule_id from query params or path params
+            if 'rule_id' not in params and 'rule_id' in validated_path_params:
+                params['rule_id'] = validated_path_params['rule_id']
+            return deprecated_techniques.check_rule_deprecated_techniques(params)
+        
+        if http_method == 'POST' and normalized_path == '/deprecated/update-mappings':
+            # Parse body for POST request
+            body = json.loads(event.get('body', '{}'))
+            return deprecated_techniques.update_deprecated_mappings(body)
+        
         # Global search
         if http_method == 'GET' and normalized_path == '/search':
             return handle_global_search(params)
@@ -292,55 +360,6 @@ def route_request(http_method: str, path: str, params: Dict[str, Any], event: Di
     except Exception as e:
         logger.error(f"Unexpected error in routing: {e}", exc_info=True)
         return create_error_response(500, "Internal server error")
-
-def handle_global_search(params: Dict[str, Any]) -> Dict[str, Any]:
-    """Handle global search across all entities"""
-    try:
-        query = params.get('query', '').strip()
-        if not query or len(query) < 2:
-            return create_api_response(400, {"error": "Query must be at least 2 characters"})
-        
-        results = {
-            'query': query,
-            'results': {
-                'rules': [],
-                'mitre_techniques': [],
-                'cves': [],
-                'total_count': 0
-            }
-        }
-        
-        # Search rules
-        rule_results = rules.search_rules({**params, 'limit': 10})
-        if rule_results['statusCode'] == 200:
-            rule_data = json.loads(rule_results['body'])
-            results['results']['rules'] = rule_data.get('items', [])
-        
-        # Search CVEs if relevant
-        if 'cve' in query.lower():
-            cve_results = cve.search_cves({**params, 'limit': 10})
-            if cve_results['statusCode'] == 200:
-                cve_data = json.loads(cve_results['body'])
-                results['results']['cves'] = cve_data.get('items', [])
-        
-        # Search MITRE techniques if relevant
-        if query.upper().startswith('T') or 'mitre' in query.lower():
-            mitre_results = mitre.get_techniques_list({**params, 'limit': 10})
-            if mitre_results['statusCode'] == 200:
-                mitre_data = json.loads(mitre_results['body'])
-                results['results']['mitre_techniques'] = mitre_data.get('items', [])
-        
-        results['results']['total_count'] = (
-            len(results['results']['rules']) +
-            len(results['results']['cves']) +
-            len(results['results']['mitre_techniques'])
-        )
-        
-        return create_api_response(200, results)
-        
-    except Exception as e:
-        logger.error(f"Error in global search: {e}", exc_info=True)
-        return create_error_response(500, "Search failed")
 
 def lambda_handler(event: Dict[str, Any], context: object) -> Dict[str, Any]:
     """Main Lambda handler with Cognito authentication"""

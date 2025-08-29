@@ -81,8 +81,10 @@ class MitreEnricher:
     
     def _load_valid_techniques(self, session) -> Dict[str, MitreTechnique]:
         """Load all valid MITRE techniques for validation AND create lookup cache."""
-        # Load all techniques - no is_revoked field in your schema
-        techniques = session.query(MitreTechnique).all()
+        techniques = session.query(MitreTechnique).filter(
+            (MitreTechnique.is_deprecated == False) | (MitreTechnique.is_deprecated == None),
+            (MitreTechnique.is_revoked == False) | (MitreTechnique.is_revoked == None)
+        ).all()
         
         # Create lookup dictionary by technique_id
         technique_dict = {tech.technique_id.upper(): tech for tech in techniques}
@@ -90,8 +92,30 @@ class MitreEnricher:
         # Build efficient lookup structures for name-based matching
         self._build_technique_lookup_cache(techniques)
         
+        logger.info(f"Loaded {len(technique_dict)} valid MITRE techniques")
+        
         return technique_dict
-    
+
+    def _check_deprecated_mappings(self, rule: DetectionRule, session) -> List[str]:
+        """Check if rule has existing mappings to deprecated techniques."""
+        deprecated_techniques = []
+        
+        # Query existing mappings with deprecated techniques
+        existing_mappings = session.query(
+            RuleMitreMapping, MitreTechnique
+        ).join(
+            MitreTechnique, RuleMitreMapping.technique_id == MitreTechnique.id
+        ).filter(
+            RuleMitreMapping.rule_id == rule.id,
+            MitreTechnique.is_deprecated == True
+        ).all()
+        
+        for mapping, technique in existing_mappings:
+            deprecated_techniques.append(technique.technique_id)
+            logger.warning(f"Rule {rule.id} has mapping to deprecated technique: {technique.technique_id}")
+        
+        return deprecated_techniques
+
     def _build_technique_lookup_cache(self, techniques: List[MitreTechnique]):
         """Build efficient lookup structures for technique name matching."""
         self._technique_name_lookup = {}
@@ -146,12 +170,18 @@ class MitreEnricher:
         """Enrich a single rule with MITRE technique mappings."""
         extracted_techniques = self._extract_techniques_from_rule(rule)
         
-        if not extracted_techniques:
+        # Check for deprecated technique mappings
+        deprecated_mappings = self._check_deprecated_mappings(rule, session)
+        
+        if not extracted_techniques and not deprecated_mappings:
             return
         
         self.techniques_found += len(extracted_techniques)
         
-        # Create mappings for valid techniques
+        # Track deprecated warnings
+        deprecation_warnings = []
+        
+        # Create mappings for valid (non-deprecated) techniques
         for technique_info in extracted_techniques:
             technique_id = technique_info['id']
             confidence = technique_info['confidence']
@@ -166,8 +196,60 @@ class MitreEnricher:
                 if mapping_created:
                     self.confidence_scores.append(confidence)
             else:
-                logger.debug(f"MITRE technique {technique_id} not found in database (rule {rule.id})")
-    
+                # Check if this is a deprecated technique
+                deprecated_tech = session.query(MitreTechnique).filter_by(
+                    technique_id=technique_id,
+                    is_deprecated=True
+                ).first()
+                
+                if deprecated_tech:
+                    deprecation_warnings.append(technique_id)
+                    logger.warning(f"Skipped deprecated technique {technique_id} for rule {rule.id}")
+                else:
+                    logger.debug(f"MITRE technique {technique_id} not found in database (rule {rule.id})")
+        
+        # Update rule metadata with deprecation warnings
+        if deprecated_mappings or deprecation_warnings:
+            self._add_deprecation_metadata(rule, deprecated_mappings, deprecation_warnings, session)
+
+    def _add_deprecation_metadata(self, rule: DetectionRule, existing_deprecated: List[str], 
+                                attempted_deprecated: List[str], session):
+        """Add deprecation warnings to rule metadata."""
+        if not rule.rule_metadata:
+            rule.rule_metadata = {}
+        
+        warnings = []
+        
+        if existing_deprecated:
+            warnings.append({
+                'type': 'deprecated_technique_mapping',
+                'severity': 'warning',
+                'message': f"Rule has mappings to deprecated techniques: {', '.join(existing_deprecated)}",
+                'techniques': existing_deprecated,
+                'action_required': 'Update rule to use current techniques'
+            })
+        
+        if attempted_deprecated:
+            warnings.append({
+                'type': 'deprecated_technique_reference',
+                'severity': 'info',
+                'message': f"Rule references deprecated techniques that were not mapped: {', '.join(attempted_deprecated)}",
+                'techniques': attempted_deprecated,
+                'action_required': 'Remove deprecated technique references'
+            })
+        
+        if warnings:
+            rule.rule_metadata['mitre_warnings'] = warnings
+            rule.rule_metadata['has_deprecated_techniques'] = True
+            rule.rule_metadata['last_deprecation_check'] = datetime.utcnow().isoformat()
+            
+            # Reduce enrichment score for deprecated mappings
+            if 'enrichment_score' in rule.rule_metadata:
+                rule.rule_metadata['enrichment_score'] = max(0, rule.rule_metadata['enrichment_score'] - 10)
+            
+            session.add(rule)
+            logger.info(f"Added deprecation warnings to rule {rule.id}")    
+
     def _extract_techniques_from_rule(self, rule: DetectionRule) -> List[Dict[str, Any]]:
         """Extract MITRE techniques from all rule sources."""
         techniques = []
@@ -379,6 +461,7 @@ class MitreEnricher:
             'techniques_found': self.techniques_found,
             'mappings_created': self.mappings_created,
             'mappings_updated': self.mappings_updated,
+            'deprecated_warnings': getattr(self, 'deprecated_warning_count', 0),
             'average_confidence': round(avg_confidence, 3),
             'total_mappings': self.mappings_created + self.mappings_updated
         }

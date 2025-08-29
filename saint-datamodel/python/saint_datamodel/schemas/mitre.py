@@ -32,6 +32,14 @@ class MitreTechniqueBase(BaseSchema):
     detection_description: Optional[str] = None
     mitigation_description: Optional[str] = None
     external_references: Optional[Dict[str, Any]] = None
+    
+    # Deprecation tracking fields
+    is_deprecated: bool = Field(default=False)
+    deprecated_date: Optional[datetime] = None
+    superseded_by: Optional[str] = Field(None, max_length=50)
+    deprecation_reason: Optional[str] = None
+    revoked: bool = Field(default=False)
+    version: Optional[str] = Field(None, max_length=20)
 
 class MitreTechnique(MitreTechniqueBase, TimestampSchema):
     id: int
@@ -70,9 +78,12 @@ class MitreCoverage(BaseSchema):
     rule_count: int
     average_confidence: float
     coverage_level: str  # 'none', 'low', 'medium', 'high'
+    is_deprecated: bool = Field(default=False)
+    superseded_by: Optional[str] = None
 
 class CoverageAnalysis(BaseSchema):
     total_techniques: int
     covered_techniques: int
     coverage_percentage: float
+    deprecated_techniques_count: int
     techniques: List[MitreCoverage]

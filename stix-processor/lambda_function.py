@@ -181,43 +181,44 @@ class STIXProcessor:
         
         technique_id = mitre_ref['external_id']
         
-        # Find associated tactic
-        kill_chain_phases = stix_obj.get('kill_chain_phases', [])
-        tactic_name = None
-        if kill_chain_phases:
-            tactic_name = kill_chain_phases[0].get('phase_name')
+        # Skip if already processed in this run
+        if technique_id in self.processed_objects:
+            return 'skipped'
+        self.processed_objects.add(technique_id)
         
-        tactic = None
-        if tactic_name:
-            # Convert phase name to display name (e.g., 'initial-access' -> 'Initial Access')
-            display_name = tactic_name.replace('-', ' ').title()
-            tactic = repo.session.query(MitreTactic).filter_by(name=display_name).first()
-        
-        # Check for parent technique (sub-techniques)
-        parent_technique = None
-        if '.' in technique_id:
-            parent_id = technique_id.split('.')[0]
-            parent_technique = repo.session.query(MitreTechnique).filter_by(technique_id=parent_id).first()
+        # Get parent technique if this is a subtechnique
+        parent_technique_id = None
+        is_subtechnique = '.' in technique_id
+        if is_subtechnique:
+            parent_technique_id = technique_id.split('.')[0]
         
         # Check if technique exists
         existing_technique = repo.session.query(MitreTechnique).filter_by(technique_id=technique_id).first()
+        
+        # Extract deprecated status and revoked status
+        is_deprecated = stix_obj.get('x_mitre_deprecated', False)
+        is_revoked = stix_obj.get('revoked', False)
         
         technique_data = {
             'technique_id': technique_id,
             'name': stix_obj['name'],
             'description': stix_obj.get('description', ''),
-            'tactic_id': tactic.id if tactic else None,
-            'parent_technique_id': parent_technique.id if parent_technique else None,
-            'kill_chain_phases': [phase['phase_name'] for phase in kill_chain_phases],
+            'is_subtechnique': is_subtechnique,
+            'parent_technique_id': parent_technique_id,
+            'stix_id': stix_obj['id'],
             'platforms': stix_obj.get('x_mitre_platforms', []),
             'data_sources': stix_obj.get('x_mitre_data_sources', []),
-            'detection_description': stix_obj.get('x_mitre_detection', ''),
+            'defense_bypassed': stix_obj.get('x_mitre_defense_bypassed', []),
+            'permissions_required': stix_obj.get('x_mitre_permissions_required', []),
+            'is_deprecated': is_deprecated,
+            'is_revoked': is_revoked,
             'external_references': {
                 'stix_id': stix_obj['id'],
                 'external_references': external_refs,
                 'domain': domain,
-                'is_subtechnique': '.' in technique_id,
-                'deprecated': stix_obj.get('x_mitre_deprecated', False),
+                'kill_chain_phases': stix_obj.get('kill_chain_phases', []),
+                'deprecated': is_deprecated,
+                'revoked': is_revoked,
                 'version': stix_obj.get('x_mitre_version', '1.0')
             }
         }
@@ -228,13 +229,18 @@ class STIXProcessor:
                 if key != 'technique_id':  # Don't update primary identifier
                     setattr(existing_technique, key, value)
             existing_technique.updated_date = utc_now()
+            
+            # Log if deprecation status changed
+            if existing_technique.is_deprecated != is_deprecated:
+                logger.warning(f"Technique {technique_id} deprecation status changed to {is_deprecated}")
+            
             logger.info(f"Updated technique: {technique_id}")
             return 'updated'
         else:
             # Create new technique
             new_technique = MitreTechnique(**technique_data)
             repo.session.add(new_technique)
-            logger.info(f"Created technique: {technique_id}")
+            logger.info(f"Created technique: {technique_id} (deprecated: {is_deprecated})")
             return 'created'
     
     def _process_group(self, stix_obj: Dict[str, Any], repo: MitreRepository, memory_store: MemoryStore, domain: str) -> str:
