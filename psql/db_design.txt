@@ -1,0 +1,163 @@
+                  List of relations
+ Schema |           Name           | Type  |  Owner
+--------+--------------------------+-------+---------
+ public | cached_statistics        | table | pgadmin
+ public | cve_entries              | table | pgadmin
+ public | detection_rules          | table | pgadmin
+ public | intel_feeds              | table | pgadmin
+ public | iocs                     | table | pgadmin
+ public | mitre_groups             | table | pgadmin
+ public | mitre_software           | table | pgadmin
+ public | mitre_tactics            | table | pgadmin
+ public | mitre_techniques         | table | pgadmin
+ public | rule_analysis            | table | pgadmin
+ public | rule_categories          | table | pgadmin
+ public | rule_category_mappings   | table | pgadmin
+ public | rule_cluster_memberships | table | pgadmin
+ public | rule_clusters            | table | pgadmin
+ public | rule_cve_details         | table | pgadmin
+ public | rule_cve_mappings        | table | pgadmin
+ public | rule_ioc_mappings        | table | pgadmin
+ public | rule_mitre_mappings      | table | pgadmin
+ public | rule_mitre_techniques    | table | pgadmin
+ public | rule_performance         | table | pgadmin
+ public | rule_sources             | table | pgadmin
+ public | rules                    | table | pgadmin
+ public | vulnerability_feeds      | table | pgadmin
+(23 rows)
+
+                                             Table "public.detection_rules"
+       Column        |            Type             | Collation | Nullable |                   Default
+---------------------+-----------------------------+-----------+----------+---------------------------------------------
+ id                  | integer                     |           | not null | nextval('detection_rules_id_seq'::regclass)
+ rule_id             | character varying(255)      |           | not null |
+ source_id           | integer                     |           |          |
+ name                | character varying(255)      |           | not null |
+ description         | text                        |           |          |
+ rule_content        | text                        |           | not null |
+ rule_type           | character varying(50)       |           | not null |
+ severity            | character varying(20)       |           |          |
+ confidence_score    | numeric(3,2)                |           |          |
+ false_positive_rate | numeric(5,4)                |           |          |
+ last_tested         | timestamp without time zone |           |          |
+ is_active           | boolean                     |           |          | true
+ tags                | text[]                      |           |          |
+ rule_metadata       | jsonb                       |           |          |
+ hash                | character varying(64)       |           |          |
+ created_date        | timestamp without time zone |           |          | CURRENT_TIMESTAMP
+ updated_date        | timestamp without time zone |           |          | CURRENT_TIMESTAMP
+Indexes:
+    "detection_rules_pkey" PRIMARY KEY, btree (id)
+    "detection_rules_hash_key" UNIQUE CONSTRAINT, btree (hash)
+    "idx_detection_rules_modified" btree (updated_date DESC)
+    "idx_detection_rules_severity" btree (severity, is_active)
+    "idx_detection_rules_source_type" btree (source_id, rule_type)
+    "idx_detection_rules_tags" gin (tags)
+    "idx_rule_metadata_mitre_techniques" gin ((rule_metadata -> 'extracted_mitre_techniques'::text))
+    "idx_rule_metadata_platforms" gin ((rule_metadata -> 'rule_platforms'::text))
+    "idx_rule_metadata_validation_status" btree ((rule_metadata ->> 'validation_status'::text))
+    "idx_rules_aor" gin ((rule_metadata -> 'aor'::text))
+    "idx_rules_cwe_ids" gin ((rule_metadata -> 'cwe_ids'::text))
+    "idx_rules_data_sources" gin ((rule_metadata -> 'data_sources'::text))
+    "idx_rules_info_controls" gin ((rule_metadata -> 'info_controls'::text))
+    "idx_rules_intrusion_set" gin ((rule_metadata -> 'intrusion_set'::text))
+    "idx_rules_malware_family" gin ((rule_metadata -> 'malware_family'::text))
+    "idx_rules_siem_platform" gin ((rule_metadata -> 'siem_platform'::text))
+    "idx_rules_source_org" gin ((rule_metadata -> 'source_org'::text))
+    "unique_rule_per_source" UNIQUE CONSTRAINT, btree (rule_id, source_id)
+Check constraints:
+    "chk_metadata_structure" CHECK (rule_metadata IS NULL OR (jsonb_typeof(rule_metadata -> 'data_sources'::text) = ANY (ARRAY['array'::text, 'null'::text])) AND (jsonb_typeof(rule_metadata -> 'cwe_ids'::text) = ANY (ARRAY['array'::text, 'null'::text])) AND ((rule_metadata -> 'validation'::text) IS NULL OR jsonb_typeof(rule_metadata -> 'validation'::text) = 'object'::text))
+Foreign-key constraints:
+    "detection_rules_source_id_fkey" FOREIGN KEY (source_id) REFERENCES rule_sources(id)
+Referenced by:
+    TABLE "rule_analysis" CONSTRAINT "rule_analysis_rule_id_fkey" FOREIGN KEY (rule_id) REFERENCES detection_rules(id) ON DELETE CASCADE
+    TABLE "rule_category_mappings" CONSTRAINT "rule_category_mappings_rule_id_fkey" FOREIGN KEY (rule_id) REFERENCES detection_rules(id) ON DELETE CASCADE
+    TABLE "rule_cluster_memberships" CONSTRAINT "rule_cluster_memberships_rule_id_fkey" FOREIGN KEY (rule_id) REFERENCES detection_rules(id) ON DELETE CASCADE
+    TABLE "rule_cve_mappings" CONSTRAINT "rule_cve_mappings_rule_id_fkey" FOREIGN KEY (rule_id) REFERENCES detection_rules(id) ON DELETE CASCADE
+    TABLE "rule_ioc_mappings" CONSTRAINT "rule_ioc_mappings_rule_id_fkey" FOREIGN KEY (rule_id) REFERENCES detection_rules(id) ON DELETE CASCADE
+    TABLE "rule_mitre_mappings" CONSTRAINT "rule_mitre_mappings_rule_id_fkey" FOREIGN KEY (rule_id) REFERENCES detection_rules(id) ON DELETE CASCADE
+    TABLE "rule_performance" CONSTRAINT "rule_performance_rule_id_fkey" FOREIGN KEY (rule_id) REFERENCES detection_rules(id) ON DELETE CASCADE
+
+                                                Table "public.rule_mitre_mappings"
+       Column       |            Type             | Collation | Nullable |                     Default                  
+--------------------+-----------------------------+-----------+----------+-------------------------------------------------
+ id                 | integer                     |           | not null | nextval('rule_mitre_mappings_id_seq'::regclass)
+ rule_id            | integer                     |           |          |
+ technique_id       | integer                     |           |          |
+ mapping_confidence | numeric(3,2)                |           |          | 1.00
+ mapping_source     | character varying(100)      |           |          |
+ created_date       | timestamp without time zone |           |          | CURRENT_TIMESTAMP
+ updated_date       | timestamp without time zone |           |          | CURRENT_TIMESTAMP
+Indexes:
+    "rule_mitre_mappings_pkey" PRIMARY KEY, btree (id)
+    "idx_rule_mitre_mappings_rule" btree (rule_id)
+    "idx_rule_mitre_mappings_technique" btree (technique_id)
+    "unique_rule_technique_mapping" UNIQUE CONSTRAINT, btree (rule_id, technique_id)
+Foreign-key constraints:
+    "rule_mitre_mappings_rule_id_fkey" FOREIGN KEY (rule_id) REFERENCES detection_rules(id) ON DELETE CASCADE
+    "rule_mitre_mappings_technique_id_fkey" FOREIGN KEY (technique_id) REFERENCES mitre_techniques(id) ON DELETE CASCADE
+
+                                            Table "public.rule_cve_mappings"
+      Column       |            Type             | Collation | Nullable |                    Default
+-------------------+-----------------------------+-----------+----------+-----------------------------------------------
+ id                | integer                     |           | not null | nextval('rule_cve_mappings_id_seq'::regclass)
+ rule_id           | integer                     |           |          |
+ cve_id            | integer                     |           |          |
+ relationship_type | character varying(50)       |           |          |
+ confidence_score  | numeric(3,2)                |           |          | 1.00
+ created_date      | timestamp without time zone |           |          | CURRENT_TIMESTAMP
+ updated_date      | timestamp without time zone |           |          | CURRENT_TIMESTAMP
+Indexes:
+    "rule_cve_mappings_pkey" PRIMARY KEY, btree (id)
+    "idx_rule_cve_mappings_rule" btree (rule_id)
+    "unique_rule_cve_relationship" UNIQUE CONSTRAINT, btree (rule_id, cve_id, relationship_type)
+Foreign-key constraints:
+    "rule_cve_mappings_cve_id_fkey" FOREIGN KEY (cve_id) REFERENCES cve_entries(id) ON DELETE CASCADE
+    "rule_cve_mappings_rule_id_fkey" FOREIGN KEY (rule_id) REFERENCES detection_rules(id) ON DELETE CASCADE
+
+                                             Table "public.cve_entries"
+        Column        |            Type             | Collation | Nullable |                 Default
+----------------------+-----------------------------+-----------+----------+-----------------------------------------
+ id                   | integer                     |           | not null | nextval('cve_entries_id_seq'::regclass)
+ cve_id               | character varying(20)       |           | not null |
+ description          | text                        |           |          |
+ published_date       | timestamp without time zone |           |          |
+ modified_date        | timestamp without time zone |           |          |
+ cvss_v3_score        | numeric(3,1)                |           |          |
+ cvss_v3_vector       | character varying(255)      |           |          |
+ cvss_v2_score        | numeric(3,1)                |           |          |
+ cvss_v2_vector       | character varying(255)      |           |          |
+ severity             | character varying(20)       |           |          |
+ cwe_ids              | text[]                      |           |          |
+ affected_products    | jsonb                       |           |          |
+ cve_references       | jsonb                       |           |          |
+ exploitability_score | numeric(3,1)                |           |          |
+ impact_score         | numeric(3,1)                |           |          |
+ created_date         | timestamp without time zone |           |          | CURRENT_TIMESTAMP
+ updated_date         | timestamp without time zone |           |          | CURRENT_TIMESTAMP
+Indexes:
+    "cve_entries_pkey" PRIMARY KEY, btree (id)
+    "cve_entries_cve_id_key" UNIQUE CONSTRAINT, btree (cve_id)
+Referenced by:
+    TABLE "rule_cve_mappings" CONSTRAINT "rule_cve_mappings_cve_id_fkey" FOREIGN KEY (cve_id) REFERENCES cve_entries(id) ON DELETE CASCADE
+
+     column_name     |          data_type          | character_maximum_length | is_nullable |               column_default
+---------------------+-----------------------------+--------------------------+-------------+---------------------------------------------
+ id                  | integer                     |                          | NO          | nextval('detection_rules_id_seq'::regclass)
+ rule_id             | character varying           |                      255 | NO          |
+ source_id           | integer                     |                          | YES         |
+ name                | character varying           |                      255 | NO          |
+ description         | text                        |                          | YES         |
+ rule_content        | text                        |                          | NO          |
+ rule_type           | character varying           |                       50 | NO          |
+ severity            | character varying           |                       20 | YES         |
+ confidence_score    | numeric                     |                          | YES         |
+ false_positive_rate | numeric                     |                          | YES         |
+ last_tested         | timestamp without time zone |                          | YES         |
+ is_active           | boolean                     |                          | YES         | true
+ tags                | ARRAY                       |                          | YES         |
+ rule_metadata       | jsonb                       |                          | YES         |
+ hash                | character varying           |                       64 | YES         |
+ created_date        | timestamp without time zone |                          | YES         | CURRENT_TIMESTAMP
+ updated_date        | timestamp without time zone |                          | YES         | CURRENT_TIMESTAMP
+(17 rows)

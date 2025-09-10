@@ -18,6 +18,7 @@ from saint_datamodel.models import (
     RuleMitreMapping, RuleCveMapping
 )
 from api_utils.response_helpers import create_api_response, create_error_response
+from api_utils.deprecated_handler import DeprecatedTechniqueHandler
 
 logger = logging.getLogger(__name__)
 
@@ -435,7 +436,7 @@ def search_rules(params: Dict[str, Any]) -> Dict[str, Any]:
         return create_error_response(500, "Failed to search rules")
 
 def get_rule_details(rule_id: str) -> Dict[str, Any]:
-    """Get detailed rule information with better error handling"""
+    """Get detailed rule information with deprecation checks"""
     try:
         # Try parsing as integer ID first
         try:
@@ -448,7 +449,7 @@ def get_rule_details(rule_id: str) -> Dict[str, Any]:
         with db_session() as session:
             # Use left outer joins to handle missing relationships
             rule = session.query(DetectionRule).options(
-                selectinload(DetectionRule.source),  # Load source separately
+                selectinload(DetectionRule.source),
                 selectinload(DetectionRule.mitre_mappings).selectinload(RuleMitreMapping.technique),
                 selectinload(DetectionRule.cve_mappings).selectinload(RuleCveMapping.cve)
             ).filter(id_filter).first()
@@ -456,22 +457,40 @@ def get_rule_details(rule_id: str) -> Dict[str, Any]:
             if not rule:
                 return create_error_response(404, f"Rule not found: {rule_id}")
             
-            # Build MITRE techniques list with safe access
+            # Check for deprecated techniques
+            handler = DeprecatedTechniqueHandler(session)
+            deprecation_warnings = handler.check_rule_for_deprecated_techniques(rule.id)
+            
+            # Build mapping of technique_id to deprecation info
+            deprecation_map = {
+                warning['technique_id']: warning 
+                for warning in deprecation_warnings
+            }
+            
+            # Build MITRE techniques list with deprecation flags
             mitre_techniques = []
             if rule.mitre_mappings:
                 for mapping in rule.mitre_mappings:
                     try:
                         if mapping.technique:
-                            mitre_techniques.append({
+                            technique_data = {
                                 'technique_id': mapping.technique.technique_id,
                                 'name': mapping.technique.name,
                                 'description': mapping.technique.description[:500] if mapping.technique.description else '',
-                                'confidence': float(mapping.mapping_confidence) if mapping.mapping_confidence else 1.0
-                            })
+                                'confidence': float(mapping.mapping_confidence) if mapping.mapping_confidence else 1.0,
+                                'is_deprecated': mapping.technique.is_deprecated or False,
+                                'revoked': mapping.technique.revoked or False
+                            }
+                            
+                            # Add superseded_by if available
+                            if mapping.technique.superseded_by:
+                                technique_data['superseded_by'] = mapping.technique.superseded_by
+                                
+                            mitre_techniques.append(technique_data)
                     except Exception as e:
                         logger.warning(f"Error processing MITRE mapping for rule {rule_id}: {e}")
             
-            # Build CVE references list with safe access
+            # Build CVE references list
             cve_references = []
             if rule.cve_mappings:
                 for mapping in rule.cve_mappings:
@@ -487,13 +506,18 @@ def get_rule_details(rule_id: str) -> Dict[str, Any]:
                     except Exception as e:
                         logger.warning(f"Error processing CVE mapping for rule {rule_id}: {e}")
             
-            # Serialize with enhanced error handling
+            # Serialize rule details
             try:
                 response_data = serialize_rule_detail(rule, mitre_techniques, cve_references)
+                
+                # Add deprecation information
+                response_data['deprecated_technique_warnings'] = deprecation_warnings
+                response_data['has_deprecated_techniques'] = len(deprecation_warnings) > 0
+                
                 return create_api_response(200, response_data)
             except Exception as e:
                 logger.error(f"Error serializing rule {rule_id}: {e}", exc_info=True)
-                # Return minimal safe response
+                # Return minimal safe response with deprecation info
                 return create_api_response(200, {
                     'id': str(rule.id),
                     'source_rule_id': rule.rule_id,
@@ -502,6 +526,8 @@ def get_rule_details(rule_id: str) -> Dict[str, Any]:
                     'rule_type': rule.rule_type or 'unknown',
                     'severity': rule.severity or 'medium',
                     'status': 'active' if rule.is_active else 'inactive',
+                    'has_deprecated_techniques': len(deprecation_warnings) > 0,
+                    'deprecated_technique_warnings': deprecation_warnings,
                     'error_note': 'Some rule details could not be loaded'
                 })
             
